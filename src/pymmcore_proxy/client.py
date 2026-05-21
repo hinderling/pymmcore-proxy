@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import logging.handlers
 import re
 import threading
 import time
@@ -184,6 +185,8 @@ class _MDASignals:
     sequenceFinished = Signal(object)
     sequenceCanceled = Signal(object)
     sequencePauseToggled = Signal(object)
+    awaitingEvent = Signal(object, object)
+    eventStarted = Signal(object)
 
 
 # ------------------------------------------------------------------
@@ -263,8 +266,8 @@ class _MDAController:
         self.events.sequenceFinished.connect(_on_done)
         self.events.sequenceCanceled.connect(_on_done)
         try:
-            self._client._rpc("mda.run", sequence)
-            done.wait(timeout=10.0)
+            self._client._rpc("mda.run", sequence, _timeout=None)
+            done.wait()
         finally:
             self.events.sequenceFinished.disconnect(_on_done)
             self.events.sequenceCanceled.disconnect(_on_done)
@@ -310,8 +313,10 @@ class _MDAController:
                 except TimeoutError:
                     pass
 
-            # Ensure sequenceFinished/Canceled signal has arrived
-            done.wait(timeout=10.0)
+            # Ensure sequenceFinished/Canceled signal has arrived.
+            # No timeout: mda.run() is non-blocking, so the server ack arrives
+            # before the MDA completes. We must wait indefinitely here.
+            done.wait()
         finally:
             self.events.sequenceFinished.disconnect(_on_done)
             self.events.sequenceCanceled.disconnect(_on_done)
@@ -319,8 +324,11 @@ class _MDAController:
     def cancel(self) -> None:
         self._client._rpc("mda.cancel")
 
+    def set_paused(self, paused: bool) -> None:
+        self._client._rpc("mda.set_paused", paused)
+
     def toggle_pause(self) -> None:
-        self._client._rpc("mda.toggle_pause")
+        self.set_paused(not self.is_paused())
 
     def is_running(self) -> bool:
         return self._client._rpc("mda.is_running")
@@ -371,6 +379,7 @@ for _name in [
 for _name in [
     "frameReady", "sequenceStarted", "sequenceFinished",
     "sequenceCanceled", "sequencePauseToggled",
+    "awaitingEvent", "eventStarted",
 ]:
     _SIGNAL_MAP[f"mda.events.{_name}"] = ("mda.events", _name)
 
@@ -546,14 +555,19 @@ class RemoteMMCore(CMMCorePlus):
         exc_cls = RemoteMMCore._EXCEPTION_TYPES.get(error_type, RuntimeError)
         raise exc_cls(error_msg)
 
-    def _rpc(self, method: str, *args: Any, **kwargs: Any) -> Any:
-        """Call a method on the remote core (supports dotted paths)."""
+    def _rpc(self, method: str, *args: Any, _timeout: Any = ..., **kwargs: Any) -> Any:
+        """Call a method on the remote core (supports dotted paths).
+
+        Pass ``_timeout=None`` to disable the per-request timeout (e.g. for
+        long-running calls like ``mda.run`` whose duration is unbounded).
+        """
         payload = {
             "method": method,
             "args": [encode(a) for a in args],
             "kwargs": {k: encode(v) for k, v in kwargs.items()},
         }
-        resp = self._http.post("/rpc", json=payload)
+        timeout = self._timeout if _timeout is ... else _timeout
+        resp = self._http.post("/rpc", json=payload, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
         if data.get("ok"):
@@ -638,7 +652,7 @@ class RemoteMMCore(CMMCorePlus):
         """Connect and listen until disconnected."""
         from websockets.sync.client import connect
 
-        with connect(ws_url) as ws:
+        with connect(ws_url, ping_interval=None) as ws:
             self._signal_ws = ws
             logger.debug("Signal listener connected to %s", ws_url)
             try:
@@ -689,7 +703,11 @@ class RemoteMMCore(CMMCorePlus):
                     args=(),
                     exc_info=None,
                 )
-                logging.getLogger("pymmcore-plus").handle(record)
+                record._proxy_forwarded = True  # prevent re-forwarding loop
+                pmm_logger = logging.getLogger("pymmcore-plus")
+                for h in pmm_logger.handlers:
+                    if not isinstance(h, logging.handlers.RotatingFileHandler):
+                        h.handle(record)
                 return
             return
 

@@ -128,7 +128,7 @@ All data crosses the wire as JSON. Custom types are tagged with `"__type__"`:
 ## Tests
 
 ```bash
-# Run the proxy's own test suite (57 tests)
+# Run the proxy's own test suite (62 tests)
 pytest
 
 # Run pymmcore-plus tests against the proxy (requires pymmcore-plus repo as sibling)

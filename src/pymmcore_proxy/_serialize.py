@@ -206,7 +206,9 @@ def _reconstruct_model(obj: dict) -> Any:
     data = obj.get("data", {})
 
     # Try to import and reconstruct (check MDASequence before MDAEvent)
-    if cls_name == "MDASequence":
+    # GeneratorMDASequence is pymmcore-plus's internal wrapper for generator-based
+    # MDA runs; it carries the same fields as MDASequence so reconstruct as one.
+    if cls_name in ("MDASequence", "GeneratorMDASequence"):
         try:
             from useq import MDASequence
 

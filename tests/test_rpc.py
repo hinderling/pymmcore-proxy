@@ -1,5 +1,6 @@
 """Integration tests for RPC calls through the proxy."""
 
+import httpx
 import numpy as np
 import pytest
 
@@ -11,6 +12,67 @@ class TestHealthAndBasics:
 
     def test_repr(self, core_no_signals):
         assert "RemoteMMCore" in repr(core_no_signals)
+
+
+class TestInfoEndpoint:
+    def test_info_returns_200(self, server_url):
+        r = httpx.get(f"{server_url}/info", timeout=3.0)
+        assert r.status_code == 200
+
+    def test_info_has_core_type_key(self, server_url):
+        data = httpx.get(f"{server_url}/info", timeout=3.0).json()
+        assert "core_type" in data
+
+    def test_info_core_type_is_cmmcoreplus(self, server_url):
+        """The conftest demo_core fixture creates a CMMCorePlus instance."""
+        data = httpx.get(f"{server_url}/info", timeout=3.0).json()
+        assert data["core_type"] == "CMMCorePlus"
+
+    def test_info_does_not_break_health(self, server_url):
+        """Calling /info must not affect /health."""
+        httpx.get(f"{server_url}/info", timeout=3.0)
+        r = httpx.get(f"{server_url}/health", timeout=3.0)
+        assert r.json()["status"] == "ok"
+
+    def test_info_core_type_unicore(self):
+        """A server backed by UniMMCore returns 'UniMMCore'."""
+        import socket
+        import threading
+        import time
+        import uvicorn
+        from pymmcore_plus.experimental.unicore import UniMMCore
+        from pymmcore_proxy import ProxyServer
+
+        core = UniMMCore()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        proxy = ProxyServer(core, port=port)
+        config = uvicorn.Config(proxy.app, host="127.0.0.1", port=port, log_level="warning", ws="wsproto")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        url = f"http://127.0.0.1:{port}"
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                if httpx.get(f"{url}/health", timeout=1.0).status_code == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
+        else:
+            server.should_exit = True
+            pytest.fail("UniMMCore proxy server did not start in time")
+
+        try:
+            data = httpx.get(f"{url}/info", timeout=3.0).json()
+            assert data["core_type"] == "UniMMCore"
+        finally:
+            server.should_exit = True
+            thread.join(timeout=5.0)
 
 
 class TestDeviceInfo:

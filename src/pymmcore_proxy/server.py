@@ -16,6 +16,7 @@ import queue
 import threading
 import time
 import warnings
+from contextlib import asynccontextmanager
 from typing import Any
 
 import numpy as np
@@ -65,6 +66,8 @@ _MDA_SIGNALS = [
     "sequenceFinished",
     "sequenceCanceled",
     "sequencePauseToggled",
+    "awaitingEvent",
+    "eventStarted",
 ]
 
 
@@ -76,6 +79,8 @@ class _LogForwarder(logging.Handler):
         self._broadcast = broadcast_fn
 
     def emit(self, record: logging.LogRecord) -> None:
+        if getattr(record, "_proxy_forwarded", False):
+            return  # already re-emitted by a client in the same process; skip
         try:
             self._broadcast("_internal", "_log", (
                 record.levelno,
@@ -111,37 +116,52 @@ class _WSEventIterator:
 class ProxyServer:
     """Wraps a CMMCorePlus/UniMMCore and serves it over HTTP + WebSocket."""
 
-    def __init__(self, core, host: str = "127.0.0.1", port: int = 5600):
+    def __init__(self, core, host: str = "127.0.0.1", port: int = 5600,
+                 extra_routes: list | None = None):
         self.core = core
         self.host = host
         self.port = port
         self._ws_clients: set[WebSocket] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._signals_connected = False
         self._stream_queue: queue.Queue | None = None
         self._stream_lock = threading.Lock()
         self._stats_lock = threading.Lock()
         self._start_time = time.time()
         self._command_count = 0
         self._recent_commands: list[dict] = []
+        # Queue-based signal sender: guarantees ordered, reliable delivery.
+        self._signal_queue: asyncio.Queue | None = None
+        self._sender_task: asyncio.Task | None = None
+
+        @asynccontextmanager
+        async def _lifespan(app):
+            self._on_startup()
+            yield
 
         self.app = Starlette(
             routes=[
                 Route("/rpc", self._handle_rpc, methods=["POST"]),
                 Route("/mda/exec_event", self._handle_mda_event, methods=["POST"]),
                 Route("/health", self._handle_health, methods=["GET"]),
+                Route("/info", self._handle_info, methods=["GET"]),
                 Route("/signals/flush", self._handle_flush, methods=["GET"]),
                 Route("/stats", self._handle_stats, methods=["GET"]),
                 WebSocketRoute("/signals", self._handle_signals),
                 WebSocketRoute("/mda/stream", self._handle_mda_stream),
+                *(extra_routes or []),
             ],
-            on_startup=[self._on_startup],
+            lifespan=_lifespan,
         )
 
     def _on_startup(self):
-        self._loop = asyncio.get_event_loop()
+        self._loop = asyncio.get_running_loop()
+        self._signal_queue = asyncio.Queue()
+        self._sender_task = asyncio.create_task(self._run_signal_sender())
         self._connect_signal_forwarding()
         self._install_warning_hook()
         self._install_log_forwarding()
+        self._signals_connected = True
 
     def _install_warning_hook(self):
         """Hook warnings.showwarning to broadcast warnings to WS clients.
@@ -222,6 +242,28 @@ class ProxyServer:
             self._broadcast_signal(group, name, args)
         return handler
 
+    async def _run_signal_sender(self) -> None:
+        """Drain the signal queue and send each message to all WS clients.
+
+        Using a single persistent task instead of per-signal
+        run_coroutine_threadsafe guarantees:
+        - Messages are sent in emission order (FIFO queue).
+        - Each send is properly awaited (no silent Future discard).
+        - No concurrent sends on the same WebSocket.
+        """
+        while True:
+            try:
+                msg = await self._signal_queue.get()
+                if msg is None:       # shutdown sentinel
+                    return
+                for ws in list(self._ws_clients):
+                    try:
+                        await ws.send_text(msg)
+                    except Exception:
+                        self._ws_clients.discard(ws)
+            except Exception as e:
+                logger.warning("Signal sender error: %s", e)
+
     def _broadcast_signal(self, group: str, name: str, args: tuple):
         if not self._ws_clients or self._loop is None:
             return
@@ -234,11 +276,17 @@ class ProxyServer:
         except Exception as e:
             logger.warning(f"Failed to serialize signal {group}.{name}: {e}")
             return
-        for ws in list(self._ws_clients):
-            try:
-                asyncio.run_coroutine_threadsafe(ws.send_text(msg), self._loop)
-            except Exception:
-                self._ws_clients.discard(ws)
+        if self._signal_queue is not None:
+            # Thread-safe enqueue: call_soon_threadsafe schedules put_nowait
+            # in the event loop, preserving emission order from any thread.
+            self._loop.call_soon_threadsafe(self._signal_queue.put_nowait, msg)
+        else:
+            # Fallback before startup (should not normally occur).
+            for ws in list(self._ws_clients):
+                try:
+                    asyncio.run_coroutine_threadsafe(ws.send_text(msg), self._loop)
+                except Exception:
+                    self._ws_clients.discard(ws)
 
     # ------------------------------------------------------------------
     # HTTP handlers
@@ -247,27 +295,32 @@ class ProxyServer:
     async def _handle_health(self, request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"})
 
+    async def _handle_info(self, request: Request) -> JSONResponse:
+        return JSONResponse({"core_type": type(self.core).__name__})
+
     async def _handle_flush(self, request: Request) -> JSONResponse:
         """Flush pending signals to all connected WebSocket clients.
 
-        Yields to the event loop so any signals queued via
-        ``run_coroutine_threadsafe`` are sent first, then sends a
-        ``_flush`` marker.  Since WS messages are ordered, the client
-        knows all prior signals have been delivered when it receives
-        the marker.
+        Enqueues a ``_flush`` marker through the same signal queue so
+        that it is guaranteed to arrive after all previously enqueued
+        signals.  The client knows all prior signals have been delivered
+        when it receives the marker.
         """
-        await asyncio.sleep(0)
         flush_id = request.query_params.get("id", str(time.monotonic()))
         msg = json.dumps({
             "group": "_internal",
             "signal": "_flush",
             "args": [flush_id],
         })
-        for ws in list(self._ws_clients):
-            try:
-                await ws.send_text(msg)
-            except Exception:
-                self._ws_clients.discard(ws)
+        if self._signal_queue is not None:
+            self._signal_queue.put_nowait(msg)
+        else:
+            await asyncio.sleep(0)
+            for ws in list(self._ws_clients):
+                try:
+                    await ws.send_text(msg)
+                except Exception:
+                    self._ws_clients.discard(ws)
         return JSONResponse({"ok": True, "id": flush_id})
 
     async def _handle_stats(self, request: Request) -> JSONResponse:
@@ -486,6 +539,18 @@ class ProxyServer:
             pass
 
     async def _handle_signals(self, websocket: WebSocket):
+        # Lazy init: if lifespan didn't run (uvicorn lifespan="off" or startup
+        # exception), set up signals here on first WS connection instead.
+        if self._loop is None:
+            self._loop = asyncio.get_running_loop()
+        if self._signal_queue is None:
+            self._signal_queue = asyncio.Queue()
+            self._sender_task = asyncio.create_task(self._run_signal_sender())
+        if not self._signals_connected:
+            self._connect_signal_forwarding()
+            self._install_warning_hook()
+            self._install_log_forwarding()
+            self._signals_connected = True
         await websocket.accept()
         self._ws_clients.add(websocket)
         try:
@@ -504,7 +569,7 @@ class ProxyServer:
     def run(self):
         """Start the server (blocking)."""
         import uvicorn
-        uvicorn.run(self.app, host=self.host, port=self.port)
+        uvicorn.run(self.app, host=self.host, port=self.port, ws="wsproto")
 
 
 def serve(core, host: str = "127.0.0.1", port: int = 5600):

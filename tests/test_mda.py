@@ -94,11 +94,11 @@ class TestMDACancel:
         def on_frame(img, ev, meta):
             frames.append(img)
             if len(frames) == 1:
-                core.mda.toggle_pause()
+                core.mda.set_paused(True)
                 # Resume after a short delay (from another thread)
                 def resume():
                     time.sleep(0.3)
-                    core.mda.toggle_pause()
+                    core.mda.set_paused(False)
                 threading.Thread(target=resume, daemon=True).start()
 
         core.mda.events.frameReady.connect(on_frame)

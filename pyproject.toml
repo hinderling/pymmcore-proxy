@@ -23,6 +23,7 @@ dependencies = [
     "starlette",
     "uvicorn",
     "websockets",
+    "wsproto",
     "psygnal>=0.9",
     "useq-schema",
 ]

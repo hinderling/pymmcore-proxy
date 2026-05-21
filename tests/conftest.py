@@ -36,7 +36,7 @@ def server_url(demo_core):
     proxy = ProxyServer(demo_core, port=port)
 
     config = uvicorn.Config(
-        proxy.app, host="127.0.0.1", port=port, log_level="warning"
+        proxy.app, host="127.0.0.1", port=port, log_level="warning", ws="wsproto"
     )
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
